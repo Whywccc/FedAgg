@@ -9,26 +9,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from scipy.optimize import root, bisect
+except ImportError:
+    root = None
+    bisect = None
 
-import numpy as np
-from scipy.optimize import root
 import torch as t
-import torch.nn as nn
 import matplotlib.pyplot as plt
 from torch.nn import functional as F
-import torch
-import numpy as np
-
-import numpy as np
-from scipy.optimize import root,bisect
-import torch
 from torch import nn
-import matplotlib.pyplot as plt
-import torch as t
-from torch.nn import functional as F
-
-
-
 
 
 def calc_ent(_x):
@@ -86,8 +76,6 @@ class RunningAverage():
         self.total = 0
 
     def update(self, val):
-        #print("total",self.total)
-        #print("steps",self.steps)
         self.total = self.total+val
         self.steps = self.steps+1
 
@@ -106,13 +94,9 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        #correct_k = correct[:k].view(-1).float().sum(0)
         correct_k = correct[:k].contiguous().view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
-
-
-
 
 
 class KL_Loss(nn.Module):
@@ -121,20 +105,9 @@ class KL_Loss(nn.Module):
         self.T = temperature
 
     def forward(self, output_batch, teacher_outputs):
-
-        # output_batch  -> B X num_classes
-        # teacher_outputs -> B X num_classes
-
-        # loss_2 = -torch.sum(torch.sum(torch.mul(F.log_softmax(teacher_outputs,dim=1), F.softmax(teacher_outputs,dim=1)+10**(-7))))/teacher_outputs.size(0)
-        # print('loss H:',loss_2)
-
         output_batch = F.log_softmax(output_batch / self.T, dim=1)
         teacher_outputs = F.softmax(teacher_outputs / self.T, dim=1) + 10 ** (-7)
-
         loss = self.T * self.T * nn.KLDivLoss(reduction='batchmean')(output_batch, teacher_outputs)
-
-        # Same result KL-loss implementation
-        # loss = T * T * torch.sum(torch.sum(torch.mul(teacher_outputs, torch.log(teacher_outputs) - output_batch)))/teacher_outputs.size(0)
         return loss
 
 
@@ -144,15 +117,9 @@ class CE_Loss(nn.Module):
         self.T = temperature
 
     def forward(self, output_batch, teacher_outputs):
-        # output_batch      -> B X num_classes
-        # teacher_outputs   -> B X num_classes
-
         output_batch = F.log_softmax(output_batch / self.T, dim=1)
         teacher_outputs = F.softmax(teacher_outputs / self.T, dim=1)
-
-        # Same result CE-loss implementation torch.sum -> sum of all element
         loss = -self.T * self.T * torch.sum(torch.mul(output_batch, teacher_outputs)) / teacher_outputs.size(0)
-
         return loss
 
 
@@ -164,7 +131,6 @@ def save_dict_to_json(d, json_path):
         json_path: (string) path to json file
     """
     with open(json_path, 'w') as f:
-        # We need to convert the values to float for json (it doesn't accept np.array, np.float, )
         d = {k: v for k, v in d.items()}
         json.dump(d, f, indent=4)
 
@@ -191,18 +157,15 @@ def split_bn_params(model, model_params, master_params):
     return mas_bn_params, mas_rem_params
 
 
-
 class KL_Loss_equivalent(nn.Module):
-    def __init__(self, temperature=1):    
+    def __init__(self, temperature=1):
         super(KL_Loss_equivalent, self).__init__()
         self.T = temperature
 
     def forward(self, output_batch, teacher_outputs):
-
         output_batch = F.log_softmax(output_batch / self.T, dim=1)
         teacher_outputs = F.softmax(teacher_outputs / self.T, dim=1) + 10 ** (-7)
-
-        loss = self.T * self.T * \
-                    torch.sum(torch.sum(torch.mul(teacher_outputs, torch.log(teacher_outputs) - output_batch)))/teacher_outputs.size(0)
+        loss = self.T * self.T * torch.sum(
+            torch.sum(torch.mul(teacher_outputs, torch.log(teacher_outputs) - output_batch))
+        ) / teacher_outputs.size(0)
         return loss
-
