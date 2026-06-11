@@ -13,10 +13,12 @@ import math
 
 import torch
 import torch.nn.functional as F
+from torch.amp import GradScaler, autocast
 from torch import nn
 
 import utils
 from autoencoder_pretrained import create_autoencoder
+from prototype import PrototypeBank, aggregate_prototype_banks, prototype_alignment_loss
 from utils import KL_Loss
 
 
@@ -31,8 +33,24 @@ def get_temperature(args):
     return float(temperature)
 
 
+def amp_enabled(args, device):
+    return bool(_get_arg(args, "amp", False)) and device.type == "cuda"
+
+
 def _get_arg(args, name, default):
     return getattr(args, name, default)
+
+
+def prototype_enabled(args):
+    return bool(_get_arg(args, "use_prototype_bank", False)) or float(_get_arg(args, "proto_loss_weight", 0.0)) > 0.0
+
+
+def get_proto_momentum(args):
+    return float(_get_arg(args, "proto_momentum", 0.9))
+
+
+def get_proto_loss_weight(args):
+    return float(_get_arg(args, "proto_loss_weight", 0.0))
 
 
 def compute_adaptive_kd_weight(student_logits, teacher_logits, args, base_alpha):
@@ -41,8 +59,8 @@ def compute_adaptive_kd_weight(student_logits, teacher_logits, args, base_alpha)
         return float(base_alpha)
 
     with torch.no_grad():
-        teacher_prob = F.softmax(teacher_logits, dim=1)
-        student_prob = F.softmax(student_logits, dim=1)
+        teacher_prob = F.softmax(teacher_logits.float(), dim=1)
+        student_prob = F.softmax(student_logits.float(), dim=1)
         class_num = teacher_prob.size(1)
 
         entropy = -(teacher_prob * torch.log(teacher_prob.clamp_min(1e-8))).sum(dim=1)
@@ -139,24 +157,36 @@ def maybe_print_comm_stats(args, comm_round):
     )
 
 
-def test_on_cloud(cloud_model, test_data_global, comm_round):
+def test_on_cloud(cloud_model, test_data_global, comm_round, args=None):
     device = next(cloud_model.parameters()).device
+    eval_during_test = bool(_get_arg(args, "eval_during_test", False))
+    use_amp = amp_enabled(args, device)
     was_training = cloud_model.training
-    cloud_model.eval()
+    if eval_during_test:
+        cloud_model.eval()
 
     accTop1_avg = utils.RunningAverage()
     accTop5_avg = utils.RunningAverage()
-    with torch.no_grad():
+
+    def eval_batch():
         for images, labels in test_data_global:
             images = images.to(device)
             labels = labels.to(device=device, dtype=torch.long)
-            log_probs, _ = cloud_model(images)
+            with autocast("cuda", enabled=use_amp):
+                log_probs, _ = cloud_model(images)
             metrics = utils.accuracy(log_probs, labels, topk=(1, 5))
             accTop1_avg.update(metrics[0].item())
             accTop5_avg.update(metrics[1].item())
 
+    if eval_during_test:
+        with torch.no_grad():
+            eval_batch()
+    else:
+        # Legacy FedAgg demo behavior: evaluate in the model's current mode.
+        eval_batch()
+
     print("Test/AccTop1 in comm_round", comm_round, accTop1_avg.value())
-    if was_training:
+    if eval_during_test and was_training:
         cloud_model.train()
 
 
@@ -191,8 +221,10 @@ def run_fedagg(
     for comm_round in range(args.comm_round):
         args.current_round = comm_round
         train_FedAgg(V1[0], args)
-        test_on_cloud(V1[0].model, test_data_global, comm_round)
+        refresh_prototype_banks(V1[0], args)
+        test_on_cloud(V1[0].model, test_data_global, comm_round, args)
         maybe_print_comm_stats(args, comm_round)
+        maybe_print_prototype_stats(args, V1[0], comm_round)
 
 
 global_index = 0
@@ -212,6 +244,11 @@ class Node:
         self.noises = []
         self.labels = []
         self.args = args
+        self.prototype_bank = None
+        if prototype_enabled(args):
+            class_num = int(_get_arg(args, "class_num", 10))
+            proto_dim = int(_get_arg(args, "proto_dim", 64))
+            self.prototype_bank = PrototypeBank(class_num, proto_dim, self.device)
         global_index += 1
 
     def is_leaf(self):
@@ -229,16 +266,73 @@ class Node:
 def create_child_for_upper_level(args, upper_level, children_number, models):
     result = []
     model_offset = 0
+    independent_clients = bool(_get_arg(args, "independent_clients", False))
     for parent in upper_level:
-        child_models = models[model_offset : model_offset + children_number]
-        if len(child_models) != children_number:
-            raise ValueError("Not enough model instances for the requested FedAgg tree.")
-        model_offset += children_number
+        if independent_clients:
+            child_models = models[model_offset : model_offset + children_number]
+            if len(child_models) != children_number:
+                raise ValueError("Not enough model instances for the requested FedAgg tree.")
+            model_offset += children_number
+        else:
+            child_models = models[:children_number]
 
         sub_nodes = [Node(args, model, parent) for model in child_models]
         parent.children = sub_nodes
         result.extend(sub_nodes)
     return result
+
+
+def update_node_prototypes_from_batch(node, features, labels, args, momentum=None):
+    if not prototype_enabled(args) or node.prototype_bank is None:
+        return
+    if momentum is None:
+        momentum = get_proto_momentum(args)
+    node.prototype_bank.update_from_batch(features.detach(), labels.detach(), momentum)
+
+
+def update_node_prototypes_from_children(node, args, momentum=None):
+    if not prototype_enabled(args) or node.prototype_bank is None or node.is_leaf():
+        return
+    if momentum is None:
+        momentum = get_proto_momentum(args)
+
+    class_num = int(_get_arg(args, "class_num", 10))
+    proto_dim = int(_get_arg(args, "proto_dim", 64))
+    means, counts = aggregate_prototype_banks(
+        [child.prototype_bank for child in node.children],
+        class_num,
+        proto_dim,
+        node.device,
+    )
+    node.prototype_bank.update(means, counts, momentum)
+
+
+def refresh_prototype_banks(node, args):
+    if not prototype_enabled(args):
+        return
+    if node.is_leaf():
+        return
+    for child in node.children:
+        refresh_prototype_banks(child, args)
+    update_node_prototypes_from_children(node, args)
+
+
+def maybe_print_prototype_stats(args, root, comm_round):
+    if not prototype_enabled(args) or not _get_arg(args, "track_proto", False):
+        return
+    if root.prototype_bank is None:
+        return
+
+    class_num = int(_get_arg(args, "class_num", 10))
+    coverage = root.prototype_bank.coverage()
+    print(
+        "Proto/Bank in comm_round",
+        comm_round,
+        "cloud_coverage",
+        f"{coverage}/{class_num}",
+        "mean_norm",
+        round(root.prototype_bank.mean_norm(), 4),
+    )
 
 
 def train_FedAgg(node, args):
@@ -257,19 +351,30 @@ def Init(node):
     if node.is_root():
         for child in node.children:
             Init(child)
+        update_node_prototypes_from_children(node, node.args, momentum=0.0)
     elif node.is_leaf():
+        use_proto = prototype_enabled(node.args)
+        was_training = node.model.training
+        if use_proto:
+            node.model.eval()
         for img, label in node.dataset:
             img = img.to(node.device)
             label = label.to(device=node.device, dtype=torch.long)
             with torch.no_grad():
                 noise = node.autoencoder.encoder(img)
+                if use_proto:
+                    _, features = node.model(img)
+                    update_node_prototypes_from_batch(node, features, label, node.args, momentum=0.0)
             node.noises.append(noise.detach())
             node.labels.append(label.detach())
+        if use_proto and was_training:
+            node.model.train()
         node.father.noises.extend(node.noises)
         node.father.labels.extend(node.labels)
     else:
         for child in node.children:
             Init(child)
+        update_node_prototypes_from_children(node, node.args, momentum=0.0)
         node.father.noises.extend(node.noises)
         node.father.labels.extend(node.labels)
 
@@ -287,8 +392,10 @@ class Loss_Non_Leaf(nn.Module):
         self.ce_loss_crit = nn.CrossEntropyLoss()
 
     def forward(self, output_batch, teacher_outputs, label, kd_weight=None):
+        output_batch = output_batch.float()
+        teacher_outputs = teacher_outputs.detach().float()
         loss_ce = self.ce_loss_crit(output_batch, label.long())
-        loss_kl = self.kl_loss_crit(output_batch, teacher_outputs.detach())
+        loss_kl = self.kl_loss_crit(output_batch, teacher_outputs)
         alpha = self.alpha if kd_weight is None else kd_weight
         return loss_ce + alpha * loss_kl
 
@@ -308,7 +415,7 @@ class Loss_Leaf(nn.Module):
             label.long(),
             kd_weight=kd_weight,
         )
-        loss_ce = self.ce_loss_crit(output_true, label.long())
+        loss_ce = self.ce_loss_crit(output_true.float(), label.long())
         return loss_leaf + self.alpha2 * loss_ce
 
 
@@ -325,10 +432,14 @@ def BSBODP_dir(node_origin, node_neigh, args):
     non_leaf_alpha = float(_get_arg(args, "kd_alpha_non_leaf", 10.0))
     leaf_alpha = float(_get_arg(args, "kd_alpha_leaf", 1.0))
     leaf_ce_weight = float(_get_arg(args, "leaf_ce_weight", 1.0))
+    use_amp = amp_enabled(args, device)
+    proto_loss_weight = get_proto_loss_weight(args)
+    target_proto_bank = node_neigh.prototype_bank if prototype_enabled(args) else None
 
     crit_non_leaf = Loss_Non_Leaf(temperature, non_leaf_alpha).to(device)
     crit_leaf = Loss_Leaf(temperature, leaf_alpha, leaf_ce_weight).to(device)
     optimizer = torch.optim.SGD(node_origin.model.parameters(), lr=node_origin.args.lr, momentum=0.9)
+    scaler = GradScaler("cuda", enabled=use_amp)
 
     node_origin.model.train()
     node_neigh.model.eval()
@@ -340,24 +451,36 @@ def BSBODP_dir(node_origin, node_neigh, args):
         label = label.to(device=device, dtype=torch.long)
 
         with torch.no_grad():
-            fake_data = node_neigh.autoencoder.decoder(noise)
-            teacher_logits, _ = node_neigh.model(fake_data)
-            teacher_logits = prepare_teacher_logits_for_kd(teacher_logits, args)
+            with autocast("cuda", enabled=use_amp):
+                fake_data = node_neigh.autoencoder.decoder(noise)
+                teacher_logits, _ = node_neigh.model(fake_data)
+            teacher_logits = prepare_teacher_logits_for_kd(teacher_logits.float(), args)
 
-        student_logits, _ = node_origin.model(fake_data)
+        with autocast("cuda", enabled=use_amp):
+            student_logits, student_features = node_origin.model(fake_data)
+            proto_update_features = student_features
+            proto_update_labels = label
 
-        if node_origin.is_leaf():
-            img, local_label = node_origin.dataset[idx]
-            img = img.to(device)
-            local_label = local_label.to(device=device, dtype=torch.long)
-            if not torch.equal(label.detach().cpu(), local_label.detach().cpu()):
-                raise AssertionError("FedAgg latent label and local label are not aligned.")
-            true_logits, _ = node_origin.model(img)
-            kd_weight = compute_adaptive_kd_weight(student_logits, teacher_logits, args, leaf_alpha)
-            loss = crit_leaf(student_logits, teacher_logits, true_logits, label, kd_weight=kd_weight)
-        else:
-            kd_weight = compute_adaptive_kd_weight(student_logits, teacher_logits, args, non_leaf_alpha)
-            loss = crit_non_leaf(student_logits, teacher_logits, label, kd_weight=kd_weight)
+            if node_origin.is_leaf():
+                img, local_label = node_origin.dataset[idx]
+                img = img.to(device)
+                local_label = local_label.to(device=device, dtype=torch.long)
+                if not torch.equal(label.detach().cpu(), local_label.detach().cpu()):
+                    raise AssertionError("FedAgg latent label and local label are not aligned.")
+                true_logits, true_features = node_origin.model(img)
+                kd_weight = compute_adaptive_kd_weight(student_logits, teacher_logits, args, leaf_alpha)
+                loss = crit_leaf(student_logits, teacher_logits, true_logits, label, kd_weight=kd_weight)
+                proto_update_features = true_features
+                proto_update_labels = local_label
+            else:
+                kd_weight = compute_adaptive_kd_weight(student_logits, teacher_logits, args, non_leaf_alpha)
+                loss = crit_non_leaf(student_logits, teacher_logits, label, kd_weight=kd_weight)
 
-        loss.backward()
-        optimizer.step()
+            if proto_loss_weight > 0.0:
+                loss = loss + proto_loss_weight * prototype_alignment_loss(student_features, label, target_proto_bank)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        update_node_prototypes_from_batch(node_origin, proto_update_features, proto_update_labels, args)
