@@ -32,6 +32,21 @@ def add_args(parser):
     parser.add_argument("--device", type=str, default=None, help="torch device, e.g. cuda:0 or cpu")
     parser.add_argument("--seed", type=int, default=0, help="numpy/data partition seed")
     parser.add_argument(
+        "--independent_clients",
+        action="store_true",
+        help="give every client its own model instead of matching the original demo's model reuse",
+    )
+    parser.add_argument(
+        "--eval_during_test",
+        action="store_true",
+        help="switch the cloud model to eval/no_grad during test; default keeps original demo behavior",
+    )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="enable automatic mixed precision on CUDA; default keeps float32 training",
+    )
+    parser.add_argument(
         "--torch_seed",
         type=int,
         default=None,
@@ -71,6 +86,20 @@ def add_args(parser):
         help="quantize transmitted delta logits to this many bits; 0 keeps float values",
     )
     parser.add_argument("--track_comm", action="store_true", help="print simulated logit communication stats")
+    parser.add_argument(
+        "--use_prototype_bank",
+        action="store_true",
+        help="enable stage-2 class prototype extraction and aggregation",
+    )
+    parser.add_argument("--proto_dim", type=int, default=64, help="dimension of pooled class prototypes")
+    parser.add_argument("--proto_momentum", type=float, default=0.9, help="EMA momentum for prototype updates")
+    parser.add_argument(
+        "--proto_loss_weight",
+        type=float,
+        default=0.0,
+        help="weight for prototype alignment loss; 0 only tracks prototype banks",
+    )
+    parser.add_argument("--track_proto", action="store_true", help="print prototype bank coverage statistics")
 
     args = parser.parse_args()
     args.device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
