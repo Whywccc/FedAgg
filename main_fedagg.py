@@ -21,6 +21,7 @@ def add_args(parser):
     parser.add_argument("--wd", type=float, default=5e-4, help="weight decay parameter")
     parser.add_argument("--batch_size", type=int, default=8, help="input batch size for training")
     parser.add_argument("--comm_round", type=int, default=1000, help="maximum communication rounds")
+    parser.add_argument("--test_interval", type=int, default=1, help="test every N communication rounds")
     parser.add_argument("--lr", type=float, default=0.001, help="learning rate")
     parser.add_argument("--client_number", type=int, default=225, help="number of clients")
     parser.add_argument("--edge_number", type=int, default=15, help="number of edge nodes")
@@ -100,6 +101,41 @@ def add_args(parser):
         help="weight for prototype alignment loss; 0 only tracks prototype banks",
     )
     parser.add_argument("--track_proto", action="store_true", help="print prototype bank coverage statistics")
+    parser.add_argument(
+        "--bridge_mode",
+        type=str,
+        default="ae",
+        choices=["ae", "prototype", "mixed"],
+        help="bridge sample source: original AE, prototype generator, or mixed",
+    )
+    parser.add_argument("--bridge_z_dim", type=int, default=64, help="noise dimension for prototype bridge generator")
+    parser.add_argument("--bridge_hidden_dim", type=int, default=128, help="hidden width for prototype bridge generator")
+    parser.add_argument("--bridge_generator_lr", type=float, default=1e-4, help="learning rate for bridge generator")
+    parser.add_argument("--bridge_train_steps", type=int, default=1, help="generator update steps per bridge batch")
+    parser.add_argument("--bridge_train_interval", type=int, default=50, help="train generator every N bridge batches")
+    parser.add_argument(
+        "--bridge_max_updates_per_round",
+        type=int,
+        default=512,
+        help="cap generator optimizer updates in each communication round",
+    )
+    parser.add_argument("--bridge_warmup_rounds", type=int, default=10, help="rounds before generated bridge is used")
+    parser.add_argument("--bridge_ramp_rounds", type=int, default=10, help="rounds used to ramp generated bridge ratio")
+    parser.add_argument("--bridge_mix_ratio", type=float, default=0.1, help="prototype ratio in mixed bridge mode")
+    parser.add_argument("--bridge_ce_weight", type=float, default=1.0, help="teacher CE weight for generator training")
+    parser.add_argument(
+        "--bridge_proto_weight",
+        type=float,
+        default=0.1,
+        help="prototype consistency weight for generator training",
+    )
+    parser.add_argument(
+        "--bridge_diversity_weight",
+        type=float,
+        default=0.01,
+        help="diversity regularization weight for generator training",
+    )
+    parser.add_argument("--track_bridge", action="store_true", help="print prototype bridge generator statistics")
 
     args = parser.parse_args()
     args.device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
