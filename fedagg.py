@@ -18,6 +18,7 @@ from torch import nn
 
 import utils
 from autoencoder_pretrained import create_autoencoder
+from bridge_generator import PrototypeBridgeGenerator, sample_prototype_bridge, train_bridge_generator_step
 from prototype import PrototypeBank, aggregate_prototype_banks, prototype_alignment_loss
 from utils import KL_Loss
 
@@ -42,7 +43,15 @@ def _get_arg(args, name, default):
 
 
 def prototype_enabled(args):
-    return bool(_get_arg(args, "use_prototype_bank", False)) or float(_get_arg(args, "proto_loss_weight", 0.0)) > 0.0
+    return (
+        bool(_get_arg(args, "use_prototype_bank", False))
+        or float(_get_arg(args, "proto_loss_weight", 0.0)) > 0.0
+        or prototype_bridge_enabled(args)
+    )
+
+
+def prototype_bridge_enabled(args):
+    return _get_arg(args, "bridge_mode", "ae") in {"prototype", "mixed"}
 
 
 def get_proto_momentum(args):
@@ -51,6 +60,17 @@ def get_proto_momentum(args):
 
 def get_proto_loss_weight(args):
     return float(_get_arg(args, "proto_loss_weight", 0.0))
+
+
+def get_bridge_activation_scale(args):
+    if not prototype_bridge_enabled(args):
+        return 0.0
+    current_round = int(_get_arg(args, "current_round", 0))
+    warmup_rounds = max(int(_get_arg(args, "bridge_warmup_rounds", 10)), 0)
+    ramp_rounds = max(int(_get_arg(args, "bridge_ramp_rounds", 10)), 1)
+    if current_round < warmup_rounds:
+        return 0.0
+    return min(1.0, float(current_round - warmup_rounds + 1) / float(ramp_rounds))
 
 
 def compute_adaptive_kd_weight(student_logits, teacher_logits, args, base_alpha):
@@ -217,14 +237,19 @@ def run_fedagg(
     Init(V1[0])
     args.comm_dense_bytes = 0.0
     args.comm_compressed_bytes = 0.0
+    test_interval = max(int(_get_arg(args, "test_interval", 1)), 1)
 
     for comm_round in range(args.comm_round):
         args.current_round = comm_round
+        reset_bridge_round_state(args)
         train_FedAgg(V1[0], args)
         refresh_prototype_banks(V1[0], args)
-        test_on_cloud(V1[0].model, test_data_global, comm_round, args)
+        should_test = (comm_round % test_interval == 0) or (comm_round == args.comm_round - 1)
+        if should_test:
+            test_on_cloud(V1[0].model, test_data_global, comm_round, args)
         maybe_print_comm_stats(args, comm_round)
         maybe_print_prototype_stats(args, V1[0], comm_round)
+        maybe_print_bridge_stats(args, comm_round)
 
 
 global_index = 0
@@ -249,6 +274,18 @@ class Node:
             class_num = int(_get_arg(args, "class_num", 10))
             proto_dim = int(_get_arg(args, "proto_dim", 64))
             self.prototype_bank = PrototypeBank(class_num, proto_dim, self.device)
+        self.bridge_generator = None
+        self.bridge_optimizer = None
+        if prototype_bridge_enabled(args):
+            class_num = int(_get_arg(args, "class_num", 10))
+            proto_dim = int(_get_arg(args, "proto_dim", 64))
+            z_dim = int(_get_arg(args, "bridge_z_dim", 64))
+            hidden_dim = int(_get_arg(args, "bridge_hidden_dim", 128))
+            self.bridge_generator = PrototypeBridgeGenerator(class_num, proto_dim, z_dim, hidden_dim).to(self.device)
+            self.bridge_optimizer = torch.optim.Adam(
+                self.bridge_generator.parameters(),
+                lr=float(_get_arg(args, "bridge_generator_lr", 1e-4)),
+            )
         global_index += 1
 
     def is_leaf(self):
@@ -333,6 +370,51 @@ def maybe_print_prototype_stats(args, root, comm_round):
         "mean_norm",
         round(root.prototype_bank.mean_norm(), 4),
     )
+
+
+def _add_bridge_stats(args, generator_loss):
+    if generator_loss is None:
+        return
+    args.bridge_loss_sum = float(_get_arg(args, "bridge_loss_sum", 0.0)) + float(generator_loss)
+    args.bridge_loss_count = int(_get_arg(args, "bridge_loss_count", 0)) + 1
+
+
+def reset_bridge_round_state(args):
+    args.bridge_loss_sum = 0.0
+    args.bridge_loss_count = 0
+    args.bridge_batches_seen = 0
+    args.bridge_updates_this_round = 0
+
+
+def should_train_bridge_generator(args):
+    if not prototype_bridge_enabled(args):
+        return False
+
+    args.bridge_batches_seen = int(_get_arg(args, "bridge_batches_seen", 0)) + 1
+    train_interval = max(int(_get_arg(args, "bridge_train_interval", 50)), 1)
+    max_updates = max(int(_get_arg(args, "bridge_max_updates_per_round", 512)), 0)
+    current_updates = int(_get_arg(args, "bridge_updates_this_round", 0))
+
+    if max_updates <= 0 or current_updates >= max_updates:
+        return False
+    return args.bridge_batches_seen % train_interval == 0
+
+
+def mark_bridge_generator_update(args):
+    args.bridge_updates_this_round = int(_get_arg(args, "bridge_updates_this_round", 0)) + 1
+
+
+def maybe_print_bridge_stats(args, comm_round):
+    if not prototype_bridge_enabled(args) or not _get_arg(args, "track_bridge", False):
+        return
+    count = int(_get_arg(args, "bridge_loss_count", 0))
+    if count <= 0:
+        return
+    avg_loss = float(_get_arg(args, "bridge_loss_sum", 0.0)) / float(count)
+    updates = int(_get_arg(args, "bridge_updates_this_round", count))
+    print("Bridge/Generator in comm_round", comm_round, "avg_loss", round(avg_loss, 4), "updates", updates)
+    args.bridge_loss_sum = 0.0
+    args.bridge_loss_count = 0
 
 
 def train_FedAgg(node, args):
@@ -452,7 +534,34 @@ def BSBODP_dir(node_origin, node_neigh, args):
 
         with torch.no_grad():
             with autocast("cuda", enabled=use_amp):
-                fake_data = node_neigh.autoencoder.decoder(noise)
+                ae_fake_data = node_neigh.autoencoder.decoder(noise)
+
+        bridge_mode = _get_arg(args, "bridge_mode", "ae")
+        fake_data = ae_fake_data
+        if bridge_mode in {"prototype", "mixed"}:
+            if should_train_bridge_generator(args):
+                generator_loss = train_bridge_generator_step(node_neigh, node_neigh.model, label, args)
+                if generator_loss is not None:
+                    _add_bridge_stats(args, generator_loss)
+                    mark_bridge_generator_update(args)
+
+            activation_scale = get_bridge_activation_scale(args)
+            if activation_scale > 0.0:
+                proto_fake_data = sample_prototype_bridge(node_neigh, label, args)
+            else:
+                proto_fake_data = None
+
+            if proto_fake_data is not None:
+                if bridge_mode == "prototype":
+                    mix_ratio = activation_scale
+                else:
+                    mix_ratio = float(_get_arg(args, "bridge_mix_ratio", 0.5))
+                    mix_ratio = mix_ratio * activation_scale
+                mix_ratio = max(0.0, min(1.0, mix_ratio))
+                fake_data = (1.0 - mix_ratio) * ae_fake_data + mix_ratio * proto_fake_data
+
+        with torch.no_grad():
+            with autocast("cuda", enabled=use_amp):
                 teacher_logits, _ = node_neigh.model(fake_data)
             teacher_logits = prepare_teacher_logits_for_kd(teacher_logits.float(), args)
 
